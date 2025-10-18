@@ -9,11 +9,9 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-jwt-key-change-this';
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Databáze
 const db = new sqlite3.Database('./crm.db', (err) => {
     if (err) {
         console.error('Chyba při připojení k databázi:', err);
@@ -73,7 +71,6 @@ function initDatabase() {
     `);
 }
 
-// Helper funkce
 function generateApiKey() {
     return 'lcrm_' + Math.random().toString(36).substring(2, 15) + 
            Math.random().toString(36).substring(2, 15);
@@ -96,7 +93,6 @@ function authenticateToken(req, res, next) {
     });
 }
 
-// AUTH ENDPOINTY
 app.post('/api/auth/register', async (req, res) => {
     const { email, password } = req.body;
     
@@ -120,7 +116,6 @@ app.post('/api/auth/register', async (req, res) => {
                 }
                 
                 db.run('INSERT INTO stats (user_id) VALUES (?)', [this.lastID]);
-                
                 const token = jwt.sign({ id: this.lastID, email }, JWT_SECRET);
                 
                 res.json({
@@ -165,7 +160,6 @@ app.post('/api/auth/login', (req, res) => {
     });
 });
 
-// PREMIUM ENDPOINTY
 app.post('/api/verify-premium', (req, res) => {
     const { apiKey } = req.body;
     
@@ -181,7 +175,6 @@ app.post('/api/verify-premium', (req, res) => {
 app.post('/api/create-checkout-session', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
-        
         let customerId;
         
         db.get('SELECT stripe_customer_id FROM users WHERE id = ?', [userId], async (err, user) => {
@@ -209,9 +202,7 @@ app.post('/api/create-checkout-session', authenticateToken, async (req, res) => 
                             description: 'Měsíční předplatné s neomezenými funkcemi'
                         },
                         unit_amount: 1200,
-                        recurring: {
-                            interval: 'month'
-                        }
+                        recurring: { interval: 'month' }
                     },
                     quantity: 1
                 }],
@@ -229,7 +220,6 @@ app.post('/api/create-checkout-session', authenticateToken, async (req, res) => 
     }
 });
 
-// ŠABLONY
 app.get('/api/templates', authenticateToken, (req, res) => {
     db.all(
         'SELECT * FROM templates WHERE user_id = ? ORDER BY created_at DESC',
@@ -248,6 +238,23 @@ app.post('/api/templates', authenticateToken, (req, res) => {
     const userId = req.user.id;
     
     db.get('SELECT is_premium FROM users WHERE id = ?', [userId], (err, user) => {
+        const insertTemplate = () => {
+            db.run(
+                'INSERT INTO templates (user_id, name, text) VALUES (?, ?, ?)',
+                [userId, name, text],
+                function(err) {
+                    if (err) {
+                        return res.status(500).json({ error: 'Chyba při vytváření šablony' });
+                    }
+                    
+                    res.json({
+                        success: true,
+                        template: { id: this.lastID, name, text }
+                    });
+                }
+            );
+        };
+        
         if (!user.is_premium) {
             db.get(
                 'SELECT COUNT(*) as count FROM templates WHERE user_id = ?',
@@ -258,7 +265,6 @@ app.post('/api/templates', authenticateToken, (req, res) => {
                             error: 'Limit 5 šablon. Přejděte na Premium.' 
                         });
                     }
-                    
                     insertTemplate();
                 }
             );
@@ -266,23 +272,6 @@ app.post('/api/templates', authenticateToken, (req, res) => {
             insertTemplate();
         }
     });
-    
-    function insertTemplate() {
-        db.run(
-            'INSERT INTO templates (user_id, name, text) VALUES (?, ?, ?)',
-            [userId, name, text],
-            function(err) {
-                if (err) {
-                    return res.status(500).json({ error: 'Chyba při vytváření šablony' });
-                }
-                
-                res.json({
-                    success: true,
-                    template: { id: this.lastID, name, text }
-                });
-            }
-        );
-    }
 });
 
 app.delete('/api/templates/:id', authenticateToken, (req, res) => {
@@ -306,7 +295,6 @@ app.delete('/api/templates/:id', authenticateToken, (req, res) => {
     );
 });
 
-// KONTAKTY
 app.get('/api/contacts', authenticateToken, (req, res) => {
     db.all(
         'SELECT * FROM contacts WHERE user_id = ? ORDER BY saved_at DESC',
@@ -325,6 +313,28 @@ app.post('/api/contacts', authenticateToken, (req, res) => {
     const userId = req.user.id;
     
     db.get('SELECT is_premium FROM users WHERE id = ?', [userId], (err, user) => {
+        const insertContact = () => {
+            db.run(
+                'INSERT INTO contacts (user_id, name, title, profile_url, note) VALUES (?, ?, ?, ?, ?)',
+                [userId, name, title, profile_url, note],
+                function(err) {
+                    if (err) {
+                        return res.status(500).json({ error: 'Chyba při ukládání kontaktu' });
+                    }
+                    
+                    db.run(
+                        'UPDATE stats SET contacts_saved = contacts_saved + 1 WHERE user_id = ?',
+                        [userId]
+                    );
+                    
+                    res.json({
+                        success: true,
+                        contact: { id: this.lastID, name, title, profile_url, note }
+                    });
+                }
+            );
+        };
+        
         if (!user.is_premium) {
             db.get(
                 'SELECT COUNT(*) as count FROM contacts WHERE user_id = ?',
@@ -335,7 +345,6 @@ app.post('/api/contacts', authenticateToken, (req, res) => {
                             error: 'Limit 50 kontaktů. Přejděte na Premium.' 
                         });
                     }
-                    
                     insertContact();
                 }
             );
@@ -343,28 +352,6 @@ app.post('/api/contacts', authenticateToken, (req, res) => {
             insertContact();
         }
     });
-    
-    function insertContact() {
-        db.run(
-            'INSERT INTO contacts (user_id, name, title, profile_url, note) VALUES (?, ?, ?, ?, ?)',
-            [userId, name, title, profile_url, note],
-            function(err) {
-                if (err) {
-                    return res.status(500).json({ error: 'Chyba při ukládání kontaktu' });
-                }
-                
-                db.run(
-                    'UPDATE stats SET contacts_saved = contacts_saved + 1 WHERE user_id = ?',
-                    [userId]
-                );
-                
-                res.json({
-                    success: true,
-                    contact: { id: this.lastID, name, title, profile_url, note }
-                });
-            }
-        );
-    }
 });
 
 app.get('/api/contacts/export', authenticateToken, (req, res) => {
@@ -394,7 +381,6 @@ app.get('/api/contacts/export', authenticateToken, (req, res) => {
     });
 });
 
-// STATISTIKY
 app.get('/api/stats', authenticateToken, (req, res) => {
     db.get(
         'SELECT * FROM stats WHERE user_id = ?',
@@ -408,7 +394,7 @@ app.get('/api/stats', authenticateToken, (req, res) => {
         }
     );
 });
-// TEST ENDPOINTY
+
 app.get('/', (req, res) => {
     res.json({ 
         message: '🚀 LinkedIn CRM Backend API',
@@ -435,40 +421,18 @@ app.get('/api/health', (req, res) => {
     });
 });
 
-// SPUŠTĚNÍ SERVERU
 app.listen(PORT, () => {
     console.log(`🚀 Server běží na http://localhost:${PORT}`);
 });
 ```
 
-### **Krok 4: Commit changes**
-
-1. Scrolluj dolů
-2. Napiš commit message: "Add test endpoints"
-3. Klikni **"Commit changes"**
-
-### **Krok 5: Počkej na redeploy**
-
-- Render automaticky detekuje změnu
-- Počkej **2-3 minuty**
-- Sleduj Render logy
+5. Klikni **"Commit changes"**
+6. Počkej 2-3 minuty na redeploy
 
 ---
 
-## ✅ OTESTUJ PO DEPLOYI
+## ✅ OTESTUJ
 
-Pak zkus tyto URL v prohlížeči:
-
-**1. Homepage:**
+Po deployi zkus:
 ```
 https://linkedin-crm-backend.onrender.com/
-```
-Měl bys vidět JSON s informacemi o API ✅
-
-**2. Health check:**
-```
-https://linkedin-crm-backend.onrender.com/api/health
-// SPUŠTĚNÍ SERVERU
-app.listen(PORT, () => {
-    console.log(`🚀 Server běží na http://localhost:${PORT}`);
-});
