@@ -408,7 +408,66 @@ app.get('/api/stats', authenticateToken, (req, res) => {
         }
     );
 });
+// TEST ENDPOINTY
+app.get('/', (req, res) => {
+    res.json({ 
+        message: '🚀 LinkedIn CRM Backend API',
+        status: 'running',
+        version: '1.0.0',
+        endpoints: {
+            health: '/api/health',
+            auth: {
+                register: 'POST /api/auth/register',
+                login: 'POST /api/auth/login'
+            },
+            premium: 'POST /api/verify-premium',
+            templates: 'GET/POST /api/templates',
+            contacts: 'GET/POST /api/contacts'
+        }
+    });
+});
 
+app.get('/api/health', (req, res) => {
+    res.json({ 
+        status: '✅ healthy', 
+        timestamp: new Date().toISOString(),
+        database: 'connected'
+    });
+});
+
+// SPUŠTĚNÍ SERVERU
+app.listen(PORT, () => {
+    console.log(`🚀 Server běží na http://localhost:${PORT}`);
+});
+```
+
+### **Krok 4: Commit changes**
+
+1. Scrolluj dolů
+2. Napiš commit message: "Add test endpoints"
+3. Klikni **"Commit changes"**
+
+### **Krok 5: Počkej na redeploy**
+
+- Render automaticky detekuje změnu
+- Počkej **2-3 minuty**
+- Sleduj Render logy
+
+---
+
+## ✅ OTESTUJ PO DEPLOYI
+
+Pak zkus tyto URL v prohlížeči:
+
+**1. Homepage:**
+```
+https://linkedin-crm-backend.onrender.com/
+```
+Měl bys vidět JSON s informacemi o API ✅
+
+**2. Health check:**
+```
+https://linkedin-crm-backend.onrender.com/api/health
 // SPUŠTĚNÍ SERVERU
 app.listen(PORT, () => {
     console.log(`🚀 Server běží na http://localhost:${PORT}`);
