@@ -1,0 +1,570 @@
+// ==================================================================
+// LINKEDIN SALES CRM - BACKEND API
+// ==================================================================
+// Node.js + Express + Stripe + SQLite
+// Ulož jako: server.js
+
+const express = require('express');
+const cors = require('cors');
+const stripe = require('stripe')('sk_test_YOUR_STRIPE_SECRET_KEY'); // ← ZMĚŇ
+const sqlite3 = require('sqlite3').verbose();
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const JWT_SECRET = 'your-super-secret-jwt-key-change-this'; // ← ZMĚŇ
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+
+// ==================================================================
+// DATABÁZE - SQLite
+// ==================================================================
+const db = new sqlite3.Database('./crm.db', (err) => {
+    if (err) {
+        console.error('Chyba při připojení k databázi:', err);
+    } else {
+        console.log('✅ Databáze připojena');
+        initDatabase();
+    }
+});
+
+function initDatabase() {
+    // Tabulka statistik
+    db.run(`
+        CREATE TABLE IF NOT EXISTS stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            messages_sent INTEGER DEFAULT 0,
+            contacts_saved INTEGER DEFAULT 0,
+            templates_used INTEGER DEFAULT 0,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    `);
+}
+
+// ==================================================================
+// HELPER FUNKCE
+// ==================================================================
+
+// Generování API klíče
+function generateApiKey() {
+    return 'lcrm_' + Math.random().toString(36).substring(2, 15) + 
+           Math.random().toString(36).substring(2, 15);
+}
+
+// Middleware pro ověření JWT tokenu
+function authenticateToken(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    
+    if (!token) {
+        return res.status(401).json({ error: 'Token chybí' });
+    }
+    
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) {
+            return res.status(403).json({ error: 'Neplatný token' });
+        }
+        req.user = user;
+        next();
+    });
+}
+
+// ==================================================================
+// AUTH ENDPOINTY
+// ==================================================================
+
+// Registrace
+app.post('/api/auth/register', async (req, res) => {
+    const { email, password } = req.body;
+    
+    if (!email || !password) {
+        return res.status(400).json({ error: 'Email a heslo jsou povinné' });
+    }
+    
+    try {
+        // Hash hesla
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const apiKey = generateApiKey();
+        
+        db.run(
+            'INSERT INTO users (email, password, api_key) VALUES (?, ?, ?)',
+            [email, hashedPassword, apiKey],
+            function(err) {
+                if (err) {
+                    if (err.message.includes('UNIQUE')) {
+                        return res.status(400).json({ error: 'Email již existuje' });
+                    }
+                    return res.status(500).json({ error: 'Chyba serveru' });
+                }
+                
+                // Vytvoř stats pro nového uživatele
+                db.run('INSERT INTO stats (user_id) VALUES (?)', [this.lastID]);
+                
+                // Vytvoř JWT token
+                const token = jwt.sign({ id: this.lastID, email }, JWT_SECRET);
+                
+                res.json({
+                    success: true,
+                    token,
+                    apiKey,
+                    user: { id: this.lastID, email, isPremium: false }
+                });
+            }
+        );
+    } catch (error) {
+        res.status(500).json({ error: 'Chyba při registraci' });
+    }
+});
+
+// Přihlášení
+app.post('/api/auth/login', (req, res) => {
+    const { email, password } = req.body;
+    
+    db.get('SELECT * FROM users WHERE email = ?', [email], async (err, user) => {
+        if (err || !user) {
+            return res.status(400).json({ error: 'Špatný email nebo heslo' });
+        }
+        
+        const validPassword = await bcrypt.compare(password, user.password);
+        
+        if (!validPassword) {
+            return res.status(400).json({ error: 'Špatný email nebo heslo' });
+        }
+        
+        const token = jwt.sign({ id: user.id, email: user.email }, JWT_SECRET);
+        
+        res.json({
+            success: true,
+            token,
+            apiKey: user.api_key,
+            user: {
+                id: user.id,
+                email: user.email,
+                isPremium: user.is_premium === 1
+            }
+        });
+    });
+});
+
+// ==================================================================
+// PREMIUM & STRIPE ENDPOINTY
+// ==================================================================
+
+// Ověření premium statusu
+app.post('/api/verify-premium', (req, res) => {
+    const { apiKey } = req.body;
+    
+    db.get('SELECT is_premium FROM users WHERE api_key = ?', [apiKey], (err, user) => {
+        if (err || !user) {
+            return res.json({ isPremium: false });
+        }
+        
+        res.json({ isPremium: user.is_premium === 1 });
+    });
+});
+
+// Vytvoření Stripe Checkout Session
+app.post('/api/create-checkout-session', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        
+        // Najdi nebo vytvoř Stripe customer
+        let customerId;
+        
+        db.get('SELECT stripe_customer_id FROM users WHERE id = ?', [userId], async (err, user) => {
+            if (user && user.stripe_customer_id) {
+                customerId = user.stripe_customer_id;
+            } else {
+                const customer = await stripe.customers.create({
+                    email: req.user.email,
+                    metadata: { userId: userId.toString() }
+                });
+                customerId = customer.id;
+                
+                db.run('UPDATE users SET stripe_customer_id = ? WHERE id = ?', 
+                    [customerId, userId]);
+            }
+            
+            // Vytvoř checkout session
+            const session = await stripe.checkout.sessions.create({
+                customer: customerId,
+                payment_method_types: ['card'],
+                line_items: [{
+                    price_data: {
+                        currency: 'usd',
+                        product_data: {
+                            name: 'LinkedIn Sales CRM Premium',
+                            description: 'Měsíční předplatné s neomezenými funkcemi'
+                        },
+                        unit_amount: 1200, // $12.00 v centech
+                        recurring: {
+                            interval: 'month'
+                        }
+                    },
+                    quantity: 1
+                }],
+                mode: 'subscription',
+                success_url: 'https://your-website.com/success?session_id={CHECKOUT_SESSION_ID}',
+                cancel_url: 'https://your-website.com/pricing',
+                metadata: { userId: userId.toString() }
+            });
+            
+            res.json({ sessionId: session.id, url: session.url });
+        });
+    } catch (error) {
+        console.error('Stripe chyba:', error);
+        res.status(500).json({ error: 'Chyba při vytváření platby' });
+    }
+});
+
+// Stripe webhook
+app.post('/api/webhook', express.raw({type: 'application/json'}), async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    const webhookSecret = 'whsec_YOUR_WEBHOOK_SECRET'; // ← ZMĚŇ
+    
+    let event;
+    
+    try {
+        event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+    } catch (err) {
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+    
+    // Zpracuj eventi
+    switch (event.type) {
+        case 'checkout.session.completed':
+            const session = event.data.object;
+            const userId = session.metadata.userId;
+            
+            // Aktivuj premium
+            db.run(
+                'UPDATE users SET is_premium = 1, stripe_subscription_id = ? WHERE id = ?',
+                [session.subscription, userId]
+            );
+            break;
+            
+        case 'customer.subscription.deleted':
+            const subscription = event.data.object;
+            
+            // Deaktivuj premium
+            db.run(
+                'UPDATE users SET is_premium = 0 WHERE stripe_subscription_id = ?',
+                [subscription.id]
+            );
+            break;
+    }
+    
+    res.json({received: true});
+});
+
+// ==================================================================
+// ŠABLONY ENDPOINTY
+// ==================================================================
+
+// Získat šablony
+app.get('/api/templates', authenticateToken, (req, res) => {
+    db.all(
+        'SELECT * FROM templates WHERE user_id = ? ORDER BY created_at DESC',
+        [req.user.id],
+        (err, templates) => {
+            if (err) {
+                return res.status(500).json({ error: 'Chyba při načítání šablon' });
+            }
+            res.json({ templates });
+        }
+    );
+});
+
+// Vytvořit šablonu
+app.post('/api/templates', authenticateToken, (req, res) => {
+    const { name, text } = req.body;
+    const userId = req.user.id;
+    
+    // Zkontroluj limit pro free uživatele
+    db.get('SELECT is_premium FROM users WHERE id = ?', [userId], (err, user) => {
+        if (!user.is_premium) {
+            db.get(
+                'SELECT COUNT(*) as count FROM templates WHERE user_id = ?',
+                [userId],
+                (err, result) => {
+                    if (result.count >= 5) {
+                        return res.status(403).json({ 
+                            error: 'Limit 5 šablon. Přejděte na Premium.' 
+                        });
+                    }
+                    
+                    insertTemplate();
+                }
+            );
+        } else {
+            insertTemplate();
+        }
+    });
+    
+    function insertTemplate() {
+        db.run(
+            'INSERT INTO templates (user_id, name, text) VALUES (?, ?, ?)',
+            [userId, name, text],
+            function(err) {
+                if (err) {
+                    return res.status(500).json({ error: 'Chyba při vytváření šablony' });
+                }
+                
+                res.json({
+                    success: true,
+                    template: { id: this.lastID, name, text }
+                });
+            }
+        );
+    }
+});
+
+// Smazat šablonu
+app.delete('/api/templates/:id', authenticateToken, (req, res) => {
+    const templateId = req.params.id;
+    const userId = req.user.id;
+    
+    db.run(
+        'DELETE FROM templates WHERE id = ? AND user_id = ?',
+        [templateId, userId],
+        function(err) {
+            if (err) {
+                return res.status(500).json({ error: 'Chyba při mazání' });
+            }
+            
+            if (this.changes === 0) {
+                return res.status(404).json({ error: 'Šablona nenalezena' });
+            }
+            
+            res.json({ success: true });
+        }
+    );
+});
+
+// ==================================================================
+// KONTAKTY ENDPOINTY
+// ==================================================================
+
+// Získat kontakty
+app.get('/api/contacts', authenticateToken, (req, res) => {
+    db.all(
+        'SELECT * FROM contacts WHERE user_id = ? ORDER BY saved_at DESC',
+        [req.user.id],
+        (err, contacts) => {
+            if (err) {
+                return res.status(500).json({ error: 'Chyba při načítání kontaktů' });
+            }
+            res.json({ contacts });
+        }
+    );
+});
+
+// Uložit kontakt
+app.post('/api/contacts', authenticateToken, (req, res) => {
+    const { name, title, profile_url, note } = req.body;
+    const userId = req.user.id;
+    
+    // Zkontroluj limit pro free uživatele
+    db.get('SELECT is_premium FROM users WHERE id = ?', [userId], (err, user) => {
+        if (!user.is_premium) {
+            db.get(
+                'SELECT COUNT(*) as count FROM contacts WHERE user_id = ?',
+                [userId],
+                (err, result) => {
+                    if (result.count >= 50) {
+                        return res.status(403).json({ 
+                            error: 'Limit 50 kontaktů. Přejděte na Premium.' 
+                        });
+                    }
+                    
+                    insertContact();
+                }
+            );
+        } else {
+            insertContact();
+        }
+    });
+    
+    function insertContact() {
+        db.run(
+            'INSERT INTO contacts (user_id, name, title, profile_url, note) VALUES (?, ?, ?, ?, ?)',
+            [userId, name, title, profile_url, note],
+            function(err) {
+                if (err) {
+                    return res.status(500).json({ error: 'Chyba při ukládání kontaktu' });
+                }
+                
+                // Update stats
+                db.run(
+                    'UPDATE stats SET contacts_saved = contacts_saved + 1 WHERE user_id = ?',
+                    [userId]
+                );
+                
+                res.json({
+                    success: true,
+                    contact: { id: this.lastID, name, title, profile_url, note }
+                });
+            }
+        );
+    }
+});
+
+// Export kontaktů do CSV
+app.get('/api/contacts/export', authenticateToken, (req, res) => {
+    // Zkontroluj premium
+    db.get('SELECT is_premium FROM users WHERE id = ?', [req.user.id], (err, user) => {
+        if (!user.is_premium) {
+            return res.status(403).json({ error: 'Pouze pro Premium uživatele' });
+        }
+        
+        db.all(
+            'SELECT name, title, profile_url, note, saved_at FROM contacts WHERE user_id = ?',
+            [req.user.id],
+            (err, contacts) => {
+                if (err) {
+                    return res.status(500).json({ error: 'Chyba při exportu' });
+                }
+                
+                // Vytvoř CSV
+                let csv = 'Name,Title,Profile URL,Note,Saved At\n';
+                contacts.forEach(c => {
+                    csv += `"${c.name}","${c.title || ''}","${c.profile_url || ''}","${c.note || ''}","${c.saved_at}"\n`;
+                });
+                
+                res.header('Content-Type', 'text/csv');
+                res.header('Content-Disposition', 'attachment; filename=contacts.csv');
+                res.send(csv);
+            }
+        );
+    });
+});
+
+// ==================================================================
+// STATISTIKY
+// ==================================================================
+
+app.get('/api/stats', authenticateToken, (req, res) => {
+    db.get(
+        'SELECT * FROM stats WHERE user_id = ?',
+        [req.user.id],
+        (err, stats) => {
+            if (err) {
+                return res.status(500).json({ error: 'Chyba při načítání statistik' });
+            }
+            
+            res.json({ stats: stats || { messages_sent: 0, contacts_saved: 0, templates_used: 0 } });
+        }
+    );
+});
+
+// ==================================================================
+// SPUŠTĚNÍ SERVERU
+// ==================================================================
+
+app.listen(PORT, () => {
+    console.log(`🚀 Server běží na http://localhost:${PORT}`);
+});
+
+// ==================================================================
+// PACKAGE.JSON
+// ==================================================================
+/*
+{
+  "name": "linkedin-crm-backend",
+  "version": "1.0.0",
+  "description": "Backend API pro LinkedIn Sales CRM",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "stripe": "^12.0.0",
+    "sqlite3": "^5.1.6",
+    "bcrypt": "^5.1.0",
+    "jsonwebtoken": "^9.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.22"
+  }
+}
+*/
+
+// ==================================================================
+// INSTALACE A SPUŠTĚNÍ
+// ==================================================================
+/*
+
+1. INSTALACE:
+   npm install
+
+2. NASTAVENÍ STRIPE:
+   - Jdi na stripe.com a vytvoř účet
+   - Zkopíruj Secret Key a vlož ho na začátek souboru
+   - Vytvoř Webhook endpoint pro produkci
+
+3. SPUŠTĚNÍ LOKÁLNĚ:
+   npm start
+   
+   Server poběží na: http://localhost:3000
+
+4. DEPLOYMENT (např. na Heroku, Railway, Render):
+   - Připoj GitHub repo
+   - Nastav environment variables:
+     * STRIPE_SECRET_KEY
+     * STRIPE_WEBHOOK_SECRET
+     * JWT_SECRET
+   - Deploy!
+
+5. TESTOVÁNÍ API:
+   curl http://localhost:3000/api/verify-premium \
+     -H "Content-Type: application/json" \
+     -d '{"apiKey":"lcrm_test123"}'
+
+*/ Tabulka uživatelů
+    db.run(`
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            is_premium BOOLEAN DEFAULT 0,
+            stripe_customer_id TEXT,
+            stripe_subscription_id TEXT,
+            api_key TEXT UNIQUE,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    `);
+    
+    // Tabulka šablon
+    db.run(`
+        CREATE TABLE IF NOT EXISTS templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            text TEXT NOT NULL,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    `);
+    
+    // Tabulka kontaktů
+    db.run(`
+        CREATE TABLE IF NOT EXISTS contacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            title TEXT,
+            profile_url TEXT,
+            note TEXT,
+            saved_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    `);
+    
+    //
